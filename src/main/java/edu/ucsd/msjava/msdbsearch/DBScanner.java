@@ -207,16 +207,61 @@ public class DBScanner {
 
         boolean containsCTermMod = aaSet.containsCTermModification();
 
+        // Snapshot of specScanner.getPepMassSpecKeyMap() as parallel sorted arrays, so the
+        // precursor-mass range lookup below is a binary search instead of a TreeMap sub-map
+        final double[] pepMasses;
+        final SpecKey[] pepMassSpecKeys;
+        // Each distinct SpecKey gets a small integer id, so its scorer and match queue are array lookups
+        final int[] pepMassKeyIds;
+        final ArrayList<SimpleDBSearchScorer<NominalMass>> keyScorerList = new ArrayList<SimpleDBSearchScorer<NominalMass>>();
+        {
+            SortedMap<Double, SpecKey> pepMassSpecKeyMap = specScanner.getPepMassSpecKeyMap();
+            synchronized (pepMassSpecKeyMap) {
+                pepMasses = new double[pepMassSpecKeyMap.size()];
+                pepMassSpecKeys = new SpecKey[pepMasses.length];
+                int k = 0;
+                for (Entry<Double, SpecKey> e : pepMassSpecKeyMap.entrySet()) {
+                    pepMasses[k] = e.getKey();
+                    pepMassSpecKeys[k] = e.getValue();
+                    k++;
+                }
+            }
+            pepMassKeyIds = new int[pepMasses.length];
+            Map<SpecKey, Integer> keyIds = new HashMap<SpecKey, Integer>();
+            Map<SpecKey, SimpleDBSearchScorer<NominalMass>> scorerMap = specScanner.getSpecKeyScorerMap();
+            for (int k = 0; k < pepMassSpecKeys.length; k++) {
+                Integer id = keyIds.get(pepMassSpecKeys[k]);
+                if (id == null) {
+                    id = keyIds.size();
+                    keyIds.put(pepMassSpecKeys[k], id);
+                    keyScorerList.add(scorerMap.get(pepMassSpecKeys[k]));
+                }
+                pepMassKeyIds[k] = id;
+            }
+        }
+        @SuppressWarnings("unchecked")
+        final PriorityQueue<DatabaseMatch>[] keyMatchQueues = new PriorityQueue[keyScorerList.size()];
+
         try {
-            DataInputStream indices = new DataInputStream(new BufferedInputStream(new FileInputStream(sa.getIndexFile())));
+            // Prefer the shared memory maps; fall back to streaming the files
+            java.nio.ByteBuffer indexMap = sa.getIndexMap();
+            java.nio.ByteBuffer nlcpMap = sa.getNeighboringLcpMap();
+            boolean useMaps = indexMap != null && nlcpMap != null;
+            DataInputStream indices = null;
+            DataInputStream nlcps = null;
+            if (!useMaps) {
+                indices = new DataInputStream(new BufferedInputStream(new FileInputStream(sa.getIndexFile())));
 
-            // skip size and id
-            indices.skip(CompactSuffixArray.INT_BYTE_SIZE * 2 + CompactSuffixArray.INT_BYTE_SIZE * fromIndex);
+                // skip size and id
+                indices.skip(CompactSuffixArray.INT_BYTE_SIZE * 2 + CompactSuffixArray.INT_BYTE_SIZE * fromIndex);
 
-            DataInputStream nlcps = new DataInputStream(new BufferedInputStream(new FileInputStream(sa.getNeighboringLcpFile())));
+                nlcps = new DataInputStream(new BufferedInputStream(new FileInputStream(sa.getNeighboringLcpFile())));
 
-            // skip size
-            nlcps.skip(CompactSuffixArray.INT_BYTE_SIZE * 2 + fromIndex);
+                // skip size
+                nlcps.skip(CompactSuffixArray.INT_BYTE_SIZE * 2 + fromIndex);
+            }
+            final int indexMapOffset = CompactSuffixArray.INT_BYTE_SIZE * 2 + CompactSuffixArray.INT_BYTE_SIZE * fromIndex;
+            final int nlcpMapOffset = CompactSuffixArray.INT_BYTE_SIZE * 2 + fromIndex;
             CompactFastaSequence sequence = sa.getSequence();
 
             boolean isProteinNTerm = true;
@@ -233,6 +278,11 @@ public class DBScanner {
                 private static final long serialVersionUID = 1L;
             }
             MatchList[] prevMatchList = new MatchList[maxPeptideLength + 2];
+            // Bit L is set iff prevMatchList[L] != null (when prevMatchList fits in 64 bits), so the
+            // per-suffix loop below only visits peptide lengths that have matches
+            final boolean useNonNullMask = prevMatchList.length <= 64;
+            long nonNullMask = 0L;
+            final long minLengthMask = minPeptideLength >= 64 ? 0L : (minPeptideLength <= 0 ? -1L : -(1L << minPeptideLength));
 
             for (int bufferIndex = 0; bufferIndex < numIndices; bufferIndex++) {
                 // Print out the progress
@@ -240,10 +290,19 @@ public class DBScanner {
                     output.print(threadName + ": Database search progress... ");
                     output.format("%.1f%% complete\n", bufferIndex / (float) numIndices * 100);
                 }
-                progress.report(bufferIndex, numIndices);
+                // Reporting is cheap but happens once per suffix; throttle it
+                if ((bufferIndex & 0xFFFF) == 0)
+                    progress.report(bufferIndex, numIndices);
                 isExtensionAtTheSameIndex = false;
-                int index = indices.readInt();
-                int lcp = nlcps.readByte();
+                int index;
+                int lcp;
+                if (useMaps) {
+                    index = indexMap.getInt(indexMapOffset + CompactSuffixArray.INT_BYTE_SIZE * bufferIndex);
+                    lcp = nlcpMap.get(nlcpMapOffset + bufferIndex);
+                } else {
+                    index = indices.readInt();
+                    lcp = nlcps.readByte();
+                }
                 if (bufferIndex == 0)
                     lcp = 0;
 
@@ -258,10 +317,22 @@ public class DBScanner {
                 }
 
                 // lcp: shared prefix length
-                for (int peptideLength = minPeptideLength; peptideLength < prevMatchList.length; peptideLength++) {
-                    if (Thread.currentThread().isInterrupted()) {
-                        return;
+                // (interruption is checked once per suffix, just above)
+                // Visits peptideLength = minPeptideLength .. prevMatchList.length-1 in increasing order,
+                // skipping lengths whose prevMatchList entry is null (nothing to do for those)
+                long remainingLengths = useNonNullMask ? (nonNullMask & minLengthMask) : 0L;
+                int peptideLength = minPeptideLength - 1;
+                while (true) {
+                    if (useNonNullMask) {
+                        if (remainingLengths == 0)
+                            break;
+                        peptideLength = Long.numberOfTrailingZeros(remainingLengths);
+                        remainingLengths &= remainingLengths - 1;    // clear the lowest set bit
+                    } else {
+                        peptideLength++;
                     }
+                    if (peptideLength >= prevMatchList.length)
+                        break;
 
                     if (lcp >= peptideLength + 2)    // peptide, N-term, C-term are shared
                     {
@@ -302,8 +373,11 @@ public class DBScanner {
                                 }
                             }
                         }
-                    } else
+                    } else {
                         prevMatchList[peptideLength] = null;
+                        if (useNonNullMask)
+                            nonNullMask &= ~(1L << peptideLength);
+                    }
                 }
 
                 if (lcp >= peptideLengthIndex + 2 ||
@@ -499,8 +573,10 @@ public class DBScanner {
                             continue;
                         }
 
-                        Collection<SpecKey> matchedSpecKeyList = specScanner.getPepMassSpecKeyMap().subMap(leftThr, rightThr).values();
-                        if (matchedSpecKeyList.size() > 0) {
+                        // Same entries, in the same order, as pepMassSpecKeyMap.subMap(leftThr, rightThr)
+                        int matchFrom = lowerBound(pepMasses, leftThr);
+                        int matchTo = lowerBound(pepMasses, rightThr);
+                        if (matchFrom < matchTo) {
                             //////
 //							System.out.println("\tMatch: " + sequence.getCharAt(index)+"."+sequence.getSubsequence(index+1, index+i+1)+"."+sequence.getCharAt(index+i+1));
                             ///////
@@ -515,7 +591,8 @@ public class DBScanner {
                             if (pepLength < minPeptideLength)
                                 continue;
 
-                            for (SpecKey specKey : matchedSpecKeyList) {
+                            for (int matchIndex = matchFrom; matchIndex < matchTo; matchIndex++) {
+                                SpecKey specKey = pepMassSpecKeys[matchIndex];
                                 if (Thread.currentThread().isInterrupted()) {
                                     return;
                                 }
@@ -525,13 +602,15 @@ public class DBScanner {
 //								{
 //								}
 
-                                SimpleDBSearchScorer<NominalMass> scorer = specScanner.getSpecKeyScorerMap().get(specKey);
+                                int keyId = pepMassKeyIds[matchIndex];
+                                SimpleDBSearchScorer<NominalMass> scorer = keyScorerList.get(keyId);
 //								if(sequence.getSubsequence(index, index+i+1).equalsIgnoreCase("SRDTAIKT"))
 //									System.out.println("Debug");
                                 int score = cleavageScore + scorer.getScore(candidatePepGrid.getPRMGrid(j), candidatePepGrid.getNominalPRMGrid(j), 1, pepLength + 1, candidatePepGrid.getNumMods(j));
-                                PriorityQueue<DatabaseMatch> prevMatchQueue = curSpecKeyDBMatchMap.get(specKey);
+                                PriorityQueue<DatabaseMatch> prevMatchQueue = keyMatchQueues[keyId];
                                 if (prevMatchQueue == null) {
                                     prevMatchQueue = new PriorityQueue<DatabaseMatch>();
+                                    keyMatchQueues[keyId] = prevMatchQueue;
                                     curSpecKeyDBMatchMap.put(specKey, prevMatchQueue);
                                 }
 
@@ -539,8 +618,11 @@ public class DBScanner {
                                     DatabaseMatch dbMatch = new DatabaseMatch(index, (byte) (pepLength + 2), score, theoPeptideMass, nominalPeptideMass, specKey.getCharge(), candidatePepGrid.getPeptideSeq(j), scorer.getActivationMethodArr()).setProteinNTerm(isProteinNTerm).setProteinCTerm(isProteinCTerm);
                                     dbMatch.setNTermMetCleaved(isNTermMetCleaved);
                                     prevMatchQueue.add(dbMatch);
-                                    if (prevMatchList[peptideLengthIndex] == null)
+                                    if (prevMatchList[peptideLengthIndex] == null) {
                                         prevMatchList[peptideLengthIndex] = new MatchList();
+                                        if (useNonNullMask)
+                                            nonNullMask |= 1L << peptideLengthIndex;
+                                    }
                                     prevMatchList[peptideLengthIndex].add(dbMatch);
                                 } else if (prevMatchQueue.size() >= this.numPeptidesPerSpec) {
                                     int worstScore = prevMatchQueue.peek().getScore();
@@ -558,8 +640,11 @@ public class DBScanner {
                                                 prevMatchQueue.add(m);
                                         }
 
-                                        if (prevMatchList[peptideLengthIndex] == null)
+                                        if (prevMatchList[peptideLengthIndex] == null) {
                                             prevMatchList[peptideLengthIndex] = new MatchList();
+                                            if (useNonNullMask)
+                                                nonNullMask |= 1L << peptideLengthIndex;
+                                        }
                                         prevMatchList[peptideLengthIndex].add(dbMatch);
                                     }
                                 }
@@ -570,12 +655,31 @@ public class DBScanner {
                 }
             }
             this.addDBMatches(curSpecKeyDBMatchMap);
-            indices.close();
-            nlcps.close();
+            if (indices != null)
+                indices.close();
+            if (nlcps != null)
+                nlcps.close();
         } catch (IOException e) {
             e.printStackTrace();
             System.exit(-1);
         }
+    }
+
+    /**
+     * Index of the first element of the sorted array that is not less than key
+     * (using Double.compare, the ordering of a TreeMap with Double keys).
+     */
+    private static int lowerBound(double[] sorted, double key) {
+        int lo = 0;
+        int hi = sorted.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (Double.compare(sorted[mid], key) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo;
     }
 
     public void computeSpecEValue(boolean storeScoreDist) {

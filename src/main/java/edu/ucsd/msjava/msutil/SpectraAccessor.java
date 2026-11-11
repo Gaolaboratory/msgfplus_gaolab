@@ -1,6 +1,8 @@
 package edu.ucsd.msjava.msutil;
 
 import edu.ucsd.msjava.mzid.Constants;
+import edu.ucsd.msjava.mzml.FastMzMLReader;
+import edu.ucsd.msjava.mzml.FastMzMLSpectraMap;
 import edu.ucsd.msjava.mzml.MzMLAdapter;
 import edu.ucsd.msjava.mzml.MzMLSpectraIterator;
 import edu.ucsd.msjava.mzml.MzMLSpectraMap;
@@ -19,6 +21,8 @@ public class SpectraAccessor {
     private SpectrumParser spectrumParser;
 
     private MzMLAdapter mzmlAdapter = null;
+    private FastMzMLReader fastMzMLReader = null;
+    private boolean fastMzMLFailed = false;
 
     SpectrumAccessorBySpecIndex specMap = null;
     Iterator<Spectrum> specItr = null;
@@ -50,9 +54,13 @@ public class SpectraAccessor {
             if (specFormat == SpecFileFormat.MZXML)
                 specMap = new MzXMLSpectraMap(specFile.getPath());
             else if (specFormat == SpecFileFormat.MZML) {
-                if (mzmlAdapter == null)
-                    mzmlAdapter = new MzMLAdapter(specFile);
-                specMap = new MzMLSpectraMap(mzmlAdapter);
+                if (getFastMzMLReader() != null)
+                    specMap = new FastMzMLSpectraMap(fastMzMLReader);
+                else {
+                    if (mzmlAdapter == null)
+                        mzmlAdapter = new MzMLAdapter(specFile);
+                    specMap = new MzMLSpectraMap(mzmlAdapter);
+                }
             } else if (specFormat == SpecFileFormat.DTA_TXT)
                 specMap = new PNNLSpectraMap(specFile.getPath());
             else {
@@ -84,9 +92,13 @@ public class SpectraAccessor {
             if (specFormat == SpecFileFormat.MZXML)
                 specItr = new MzXMLSpectraIterator(specFile.getPath());
             else if (specFormat == SpecFileFormat.MZML) {
-                if (mzmlAdapter == null)
-                    mzmlAdapter = new MzMLAdapter(specFile);
-                specItr = new MzMLSpectraIterator(mzmlAdapter);
+                if (getFastMzMLReader() != null)
+                    specItr = fastMzMLReader.iterator();
+                else {
+                    if (mzmlAdapter == null)
+                        mzmlAdapter = new MzMLAdapter(specFile);
+                    specItr = new MzMLSpectraIterator(mzmlAdapter);
+                }
             } else if (specFormat == SpecFileFormat.DTA_TXT)
                 try {
                     specItr = new PNNLSpectraIterator(specFile.getPath());
@@ -114,6 +126,26 @@ public class SpectraAccessor {
         }
 
         return specItr;
+    }
+
+    /**
+     * The fast mzML reader, or null if it is disabled or could not index the file (jmzML is used instead)
+     */
+    private synchronized FastMzMLReader getFastMzMLReader() {
+        if (fastMzMLReader == null && !fastMzMLFailed) {
+            if (!FastMzMLReader.isEnabled()) {
+                fastMzMLFailed = true;
+            } else {
+                try {
+                    MzMLAdapter.turnOffLogs();
+                    fastMzMLReader = new FastMzMLReader(specFile);
+                } catch (Exception e) {
+                    System.out.println("Note: using jmzML to read " + specFile.getName() + " (" + e.getMessage() + ")");
+                    fastMzMLFailed = true;
+                }
+            }
+        }
+        return fastMzMLReader;
     }
 
     public Spectrum getSpectrumBySpecIndex(int specIndex) {
@@ -157,9 +189,13 @@ public class SpectraAccessor {
         else if (specFormat == SpecFileFormat.MZDATA)
             cvParam = Constants.makeCvParam("MS:1000777", "spectrum identifier nativeID format");
         else if (specFormat == SpecFileFormat.MZML) {
-            if (mzmlAdapter == null)
-                mzmlAdapter = new MzMLAdapter(specFile);
-            cvParam = mzmlAdapter.getSpectrumIDFormatCvParam();
+            if (getFastMzMLReader() != null)
+                cvParam = fastMzMLReader.getSpectrumIDFormatCvParam();
+            else {
+                if (mzmlAdapter == null)
+                    mzmlAdapter = new MzMLAdapter(specFile);
+                cvParam = mzmlAdapter.getSpectrumIDFormatCvParam();
+            }
         }
 
         return cvParam;

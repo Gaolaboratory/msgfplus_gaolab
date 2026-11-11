@@ -11,6 +11,11 @@ public class DBScanScorer extends FastScorer {
     private float probPeak;
     private boolean isNodeMassPRM;    // prefix: true, suffix: false
 
+    // Edge-score lookups precomputed per spectrum, so the search loop does not touch the
+    // scorer's shared parameter maps (see NewRankScorer.getIonExistenceScore / getErrorScore)
+    private final float[] ionExistenceScore = new float[4];
+    private float[] errorScoreTable;
+
     public DBScanScorer(NewScoredSpectrum<NominalMass> scoredSpec, int peptideMass) {
         super(scoredSpec, peptideMass);
         this.scorer = scoredSpec.getScorer();
@@ -29,6 +34,10 @@ public class DBScanScorer extends FastScorer {
 
         partition = scoredSpec.getPartition();
         probPeak = scoredSpec.getProbPeak();
+
+        for (int i = 0; i < ionExistenceScore.length; i++)
+            ionExistenceScore[i] = scorer.getIonExistenceScore(partition, i, probPeak);
+        errorScoreTable = scorer.getErrorScoreTable(partition);
     }
 
     // fromIndex: inclusive, toIndex: exclusive
@@ -68,9 +77,13 @@ public class DBScanScorer extends FastScorer {
         if (prevMass >= 0)
             ionExistenceIndex += 2;
 
-        float edgeScore = scorer.getIonExistenceScore(partition, ionExistenceIndex, probPeak);
+        float edgeScore = ionExistenceScore[ionExistenceIndex];
         if (ionExistenceIndex == 3) {
-            edgeScore += scorer.getErrorScore(partition, curMass - prevMass - theoMass);
+            float error = curMass - prevMass - theoMass;
+            if (errorScoreTable != null)
+                edgeScore += errorScoreTable[scorer.getErrorIndex(error)];
+            else
+                edgeScore += scorer.getErrorScore(partition, error);
         }
         return Math.round(edgeScore);
     }

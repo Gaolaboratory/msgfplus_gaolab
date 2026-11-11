@@ -50,6 +50,8 @@ public class CompactFastaSequence implements Sequence {
      * Reverse translation map
      */
     private HashMap<Byte, Character> byte2alpha;
+    // byte2alpha as a lookup table indexed by (b & 0xFF); '?' for unmapped bytes
+    private char[] byte2alphaTable;
 
     /**
      * String representation of the alphabet
@@ -242,8 +244,7 @@ public class CompactFastaSequence implements Sequence {
     }
 
     public char toChar(byte b) {
-        if (byte2alpha.containsKey(b)) return byte2alpha.get(b);
-        return '?';
+        return byte2alphaTable[b & 0xFF];
     }
 
     public int getAlphabetSize() {
@@ -398,6 +399,11 @@ public class CompactFastaSequence implements Sequence {
             }
             byte2alpha.put(value, tokens[i].charAt(0));
         }
+        char[] table = new char[256];
+        java.util.Arrays.fill(table, '?');
+        for (java.util.Map.Entry<Byte, Character> e : byte2alpha.entrySet())
+            table[e.getKey() & 0xFF] = e.getValue();
+        this.byte2alphaTable = table;
     }
 
     /**

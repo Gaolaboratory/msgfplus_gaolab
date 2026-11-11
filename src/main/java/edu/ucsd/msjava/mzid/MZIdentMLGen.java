@@ -253,13 +253,40 @@ public class MZIdentMLGen {
     }
 
     public synchronized void addSpectrumIdentificationResults(List<MSGFPlusMatch> resultList) {
-        for (MSGFPlusMatch mpMatch : resultList) {
+        final List<MSGFPlusMatch> results = resultList instanceof RandomAccess ? resultList : new ArrayList<MSGFPlusMatch>(resultList);
+        final SpectrumAccessorBySpecIndex specMap = specAcc.getSpecMap();
+        // The fast mzML reader is thread-safe: read the spectra of each chunk in parallel, then
+        // build the results sequentially in the original order
+        final boolean prefetch = specMap instanceof edu.ucsd.msjava.mzml.FastMzMLSpectraMap;
+        final int prefetchChunk = 4096;
+        edu.ucsd.msjava.msutil.Spectrum[] prefetched = null;
+        int prefetchedFrom = 0;
+
+        for (int resultIndex = 0; resultIndex < results.size(); resultIndex++) {
+            MSGFPlusMatch mpMatch = results.get(resultIndex);
             int specIndex = mpMatch.getSpecIndex();
             List<DatabaseMatch> matchList = mpMatch.getMatchList();
             if (matchList == null || matchList.size() == 0)
                 continue;
 
-            edu.ucsd.msjava.msutil.Spectrum spec = specAcc.getSpecMap().getSpectrumBySpecIndex(specIndex);
+            edu.ucsd.msjava.msutil.Spectrum spec;
+            if (prefetch) {
+                if (prefetched == null || resultIndex >= prefetchedFrom + prefetched.length) {
+                    final int from = resultIndex;
+                    final int to = Math.min(results.size(), from + prefetchChunk);
+                    final edu.ucsd.msjava.msutil.Spectrum[] chunk = new edu.ucsd.msjava.msutil.Spectrum[to - from];
+                    java.util.stream.IntStream.range(from, to).parallel().forEach(i -> {
+                        MSGFPlusMatch m = results.get(i);
+                        if (m.getMatchList() != null && m.getMatchList().size() > 0)
+                            chunk[i - from] = specMap.getSpectrumBySpecIndex(m.getSpecIndex());
+                    });
+                    prefetched = chunk;
+                    prefetchedFrom = from;
+                }
+                spec = prefetched[resultIndex - prefetchedFrom];
+            } else {
+                spec = specMap.getSpectrumBySpecIndex(specIndex);
+            }
             String specID = spec.getID();
             float precursorMz = spec.getPrecursorPeak().getMz();
 

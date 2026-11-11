@@ -31,7 +31,7 @@ public class CandidatePeptideGrid {
      * Number of modifications for each length prm
      */
     private int[][] numMods;
-    private StringBuffer[] peptide;
+    private StringBuilder[] peptide;
 
     // caching amino acid set for fast search
 
@@ -83,7 +83,7 @@ public class CandidatePeptideGrid {
         nominalPRM = new int[maxNumVariantsPerPeptide][maxPeptideLength + 1];
         prm = new double[maxNumVariantsPerPeptide][maxPeptideLength + 1];
         numMods = new int[maxNumVariantsPerPeptide][maxPeptideLength + 1];
-        peptide = new StringBuffer[maxNumVariantsPerPeptide];
+        peptide = new StringBuilder[maxNumVariantsPerPeptide];
         size = new int[maxPeptideLength + 1];
         nMissedCleavages = new int[maxPeptideLength + 1];
         residues = new char[maxPeptideLength + 1];
@@ -96,7 +96,7 @@ public class CandidatePeptideGrid {
             nominalPRM[i][0] = 0;
             prm[i][0] = 0.;
             numMods[i][0] = 0;
-            peptide[i] = new StringBuffer();
+            peptide[i] = new StringBuilder();
         }
         size[0] = 1;
         nMissedCleavages[0] = 0;
@@ -260,7 +260,7 @@ public class CandidatePeptideGrid {
                             nominalPRM[newIndex][k] = nominalPRM[parentIndex][k];
                             prm[newIndex][k] = prm[parentIndex][k];
                         }
-                        peptide[newIndex] = new StringBuffer(peptide[parentIndex].substring(0, length - 1));
+                        peptide[newIndex] = new StringBuilder(peptide[parentIndex].substring(0, length - 1));
                         nominalPRM[newIndex][length] = nominalPRM[newIndex][length - 1] + aaNominalMassArr[j];
                         prm[newIndex][length] = prm[newIndex][length - 1] + aaMassArr[j];
                         numMods[newIndex][length] = numModParent + 1;

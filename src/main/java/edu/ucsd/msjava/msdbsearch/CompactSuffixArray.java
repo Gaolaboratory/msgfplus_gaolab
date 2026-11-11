@@ -127,6 +127,49 @@ public class CompactSuffixArray {
         return this.nlcpFile;
     }
 
+    // Read-only memory maps of the index and nlcp files, shared by all search threads.
+    // Only absolute get() calls are used on them, which are safe to call concurrently.
+    private java.nio.MappedByteBuffer indexMap;
+    private java.nio.MappedByteBuffer nlcpMap;
+    private boolean mapAttempted = false;
+
+    private synchronized void mapFiles() {
+        if (mapAttempted)
+            return;
+        mapAttempted = true;
+        // A single MappedByteBuffer is limited to 2 GB; larger databases keep using streams
+        if (indexFile.length() > Integer.MAX_VALUE || nlcpFile.length() > Integer.MAX_VALUE)
+            return;
+        try (java.nio.channels.FileChannel ic = java.nio.channels.FileChannel.open(indexFile.toPath());
+             java.nio.channels.FileChannel nc = java.nio.channels.FileChannel.open(nlcpFile.toPath())) {
+            java.nio.MappedByteBuffer im = ic.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, ic.size());
+            java.nio.MappedByteBuffer nm = nc.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, nc.size());
+            im.load();
+            nm.load();
+            indexMap = im;
+            nlcpMap = nm;
+        } catch (IOException e) {
+            indexMap = null;
+            nlcpMap = null;
+        }
+    }
+
+    /**
+     * Memory-mapped index file (big-endian, 8-byte header), or null if it could not be mapped.
+     */
+    public synchronized java.nio.ByteBuffer getIndexMap() {
+        mapFiles();
+        return indexMap;
+    }
+
+    /**
+     * Memory-mapped nlcp file (8-byte header), or null if it could not be mapped.
+     */
+    public synchronized java.nio.ByteBuffer getNeighboringLcpMap() {
+        mapFiles();
+        return nlcpMap;
+    }
+
     public CompactFastaSequence getSequence() {
         return sequence;
     }

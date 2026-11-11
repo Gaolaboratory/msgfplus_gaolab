@@ -17,8 +17,10 @@ public class DatabaseMatch extends Match {
     private Float psmQValue = null;
     private Float pepQValue = null;
 
-    // for degenerate peptides
-    private SortedSet<Integer> indices;
+    // for degenerate peptides: other suffix-array indices of the same peptide, in insertion order
+    // (a plain int array; getIndices() returns them sorted and de-duplicated together with index)
+    private int[] extraIndices;
+    private int numExtraIndices;
 
     public DatabaseMatch(
             int index,
@@ -73,19 +75,18 @@ public class DatabaseMatch extends Match {
     }
 
     public void addIndex(int index) {
-        if (indices == null) {
-            indices = new TreeSet<Integer>();
-            indices.add(this.index);
-        }
-        indices.add(index);
+        if (extraIndices == null)
+            extraIndices = new int[4];
+        else if (numExtraIndices == extraIndices.length)
+            extraIndices = java.util.Arrays.copyOf(extraIndices, numExtraIndices * 2);
+        extraIndices[numExtraIndices++] = index;
     }
 
     public SortedSet<Integer> getIndices() {
-        if (indices == null) {
-            SortedSet<Integer> temp = new TreeSet<Integer>();
-            temp.add(index);
-            return temp;
-        }
+        SortedSet<Integer> indices = new TreeSet<Integer>();
+        indices.add(index);
+        for (int i = 0; i < numExtraIndices; i++)
+            indices.add(extraIndices[i]);
         return indices;
     }
 

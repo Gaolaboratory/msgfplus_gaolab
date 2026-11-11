@@ -20,6 +20,14 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
     private HashMap<NominalMass, ArrayList<DeNovoGraph.Edge<NominalMass>>> edgeMap;
     private HashMap<NominalMass, Integer> nodeScore;
 
+    // Array copies of edgeMap and nodeScore indexed by (nominal mass - nodeIndexOffset),
+    // built once the graph is complete (see buildNodeIndex)
+    private int nodeIndexOffset;
+    private int nodeIndexSize = 0;
+    private ArrayList<DeNovoGraph.Edge<NominalMass>>[] edgeArr;
+    private int[] nodeScoreArr;
+    private boolean[] hasNodeScoreArr;
+
     private static AtomicInteger negativeCompNodeMassWarnCount;
     private static AtomicInteger negativeNodeMassWarnCount;
 
@@ -71,9 +79,17 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
         }
 
         edgeMap = new HashMap<NominalMass, ArrayList<DeNovoGraph.Edge<NominalMass>>>();
-        edgeMap.put(source, new ArrayList<DeNovoGraph.Edge<NominalMass>>());
+        initBuildArrays();
+        putBuildEdges(source, new ArrayList<DeNovoGraph.Edge<NominalMass>>());
         setForwardEdgesFromSource();
         setForwardEdgesFromIntermediateNodes();
+        // the forward edges were collected in arrays indexed by nominal mass; copy them to edgeMap
+        for (int i = 0; i < buildEdges.length; i++) {
+            if (buildEdges[i] != null)
+                edgeMap.put(buildNodes[i], buildEdges[i]);
+        }
+        buildEdges = null;
+        buildNodes = null;
         super.intermediateNodes = new ArrayList<NominalMass>(edgeMap.keySet());
         Collections.sort(super.intermediateNodes);
         this.setBackwardEdgesFromSink();
@@ -82,6 +98,115 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
         sinkNodes.add(pmNode);
 
         computeNodeScores();
+        buildNodeIndex();
+    }
+
+    // Construction-time arrays (indexed by nominal mass - buildOffset) holding the forward edges
+    // and the node object of each node created so far; equivalent to edgeMap during construction
+    private int buildOffset;
+    private ArrayList<DeNovoGraph.Edge<NominalMass>>[] buildEdges;
+    private NominalMass[] buildNodes;
+
+    @SuppressWarnings("unchecked")
+    private void initBuildArrays() {
+        // Forward edges start at the source (0) or at an intermediate node 1..pm-1, so every node
+        // created is >= min(0, smallest amino acid nominal mass) and < pm
+        int minAANominalMass = 0;
+        for (Location location : new Location[]{Location.N_Term, Location.Protein_N_Term, Location.C_Term, Location.Protein_C_Term, Location.Anywhere}) {
+            for (AminoAcid aa : aaSet.getAAList(location))
+                minAANominalMass = Math.min(minAANominalMass, aa.getNominalMass());
+        }
+        buildOffset = minAANominalMass;
+        int size = pmNode.getNominalMass() - buildOffset + 1;
+        if (size < 1)
+            size = 1;
+        buildEdges = new ArrayList[size];
+        buildNodes = new NominalMass[size];
+    }
+
+    private ArrayList<DeNovoGraph.Edge<NominalMass>> getBuildEdges(int nominalMass) {
+        int i = nominalMass - buildOffset;
+        if (i < 0 || i >= buildEdges.length)
+            return getBuildEdgesOutOfRange(nominalMass);
+        return buildEdges[i];
+    }
+
+    private void putBuildEdges(NominalMass node, ArrayList<DeNovoGraph.Edge<NominalMass>> edges) {
+        int i = node.getNominalMass() - buildOffset;
+        if (i < 0 || i >= buildEdges.length) {
+            putBuildEdgesOutOfRange(node, edges);
+            return;
+        }
+        buildEdges[i] = edges;
+        buildNodes[i] = node;
+    }
+
+    // Not expected to be used (see initBuildArrays); kept so behavior matches the map-based version
+    private HashMap<NominalMass, ArrayList<DeNovoGraph.Edge<NominalMass>>> outOfRangeEdges = null;
+
+    private ArrayList<DeNovoGraph.Edge<NominalMass>> getBuildEdgesOutOfRange(int nominalMass) {
+        return outOfRangeEdges == null ? null : outOfRangeEdges.get(new NominalMass(nominalMass));
+    }
+
+    private void putBuildEdgesOutOfRange(NominalMass node, ArrayList<DeNovoGraph.Edge<NominalMass>> edges) {
+        if (outOfRangeEdges == null)
+            outOfRangeEdges = new HashMap<NominalMass, ArrayList<DeNovoGraph.Edge<NominalMass>>>();
+        outOfRangeEdges.put(node, edges);
+        edgeMap.put(node, edges);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void buildNodeIndex() {
+        int min = pmNode.getNominalMass();
+        int max = pmNode.getNominalMass();
+        for (NominalMass n : edgeMap.keySet()) {
+            min = Math.min(min, n.getNominalMass());
+            max = Math.max(max, n.getNominalMass());
+        }
+        for (NominalMass n : nodeScore.keySet()) {
+            min = Math.min(min, n.getNominalMass());
+            max = Math.max(max, n.getNominalMass());
+        }
+        long size = (long) max - min + 1;
+        if (size <= 0 || size > (1 << 22))
+            return;    // keep using the maps
+        int n = (int) size;
+        ArrayList<DeNovoGraph.Edge<NominalMass>>[] edges = new ArrayList[n];
+        for (java.util.Map.Entry<NominalMass, ArrayList<DeNovoGraph.Edge<NominalMass>>> e : edgeMap.entrySet())
+            edges[e.getKey().getNominalMass() - min] = e.getValue();
+        int[] scores = new int[n];
+        boolean[] hasScore = new boolean[n];
+        for (java.util.Map.Entry<NominalMass, Integer> e : nodeScore.entrySet()) {
+            if (e.getValue() == null)
+                continue;
+            int i = e.getKey().getNominalMass() - min;
+            scores[i] = e.getValue();
+            hasScore[i] = true;
+        }
+        nodeIndexOffset = min;
+        edgeArr = edges;
+        nodeScoreArr = scores;
+        hasNodeScoreArr = hasScore;
+        nodeIndexSize = n;
+
+        // cache the index of each edge's previous node on the edge (used by GeneratingFunction)
+        for (ArrayList<DeNovoGraph.Edge<NominalMass>> list : edgeMap.values()) {
+            if (list == null)
+                continue;
+            for (DeNovoGraph.Edge<NominalMass> edge : list)
+                edge.setPrevNodeIndex(getNodeIndex(edge.getPrevNode()));
+        }
+    }
+
+    @Override
+    public int getNodeIndex(NominalMass node) {
+        int i = node.getNominalMass() - nodeIndexOffset;
+        return (i >= 0 && i < nodeIndexSize) ? i : -1;
+    }
+
+    @Override
+    public int getNodeIndexSize() {
+        return nodeIndexSize;
     }
 
     @Override
@@ -91,7 +216,11 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
 
     @Override
     public ArrayList<DeNovoGraph.Edge<NominalMass>> getEdges(NominalMass curNode) {
-
+        if (curNode != null) {
+            int i = getNodeIndex(curNode);
+            if (i >= 0)
+                return edgeArr[i];
+        }
         return edgeMap.get(curNode);
     }
 
@@ -105,6 +234,10 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
             }
             return 0;
         }
+
+        int i = getNodeIndex(node);
+        if (i >= 0 && hasNodeScoreArr[i])
+            return nodeScoreArr[i];
 
         try {
             return nodeScore.get(node);
@@ -251,13 +384,29 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
         }
 
         ArrayList<AminoAcid> aaList = aaSet.getAAList(location);
-        makeForwardEdges(source, aaList, enzyme != null && direction == enzyme.isNTerm());
+        makeForwardEdges(source, aaList, aaIndices(aaList), enzyme != null && direction == enzyme.isNTerm());
+    }
+
+    private int[] aaIndices(ArrayList<AminoAcid> aaList) {
+        int[] indices = new int[aaList.size()];
+        for (int k = 0; k < indices.length; k++)
+            indices[k] = aaSet.getIndex(aaList.get(k));
+        return indices;
     }
 
     private void setForwardEdgesFromIntermediateNodes() {
         ArrayList<AminoAcid> aaList = aaSet.getAAList(Location.Anywhere);
-        for (int i = 1; i < pmNode.getNominalMass(); i++)
-            makeForwardEdges(new NominalMass(i), aaList, false);
+        int[] aaIndices = aaIndices(aaList);
+        for (int i = 1; i < pmNode.getNominalMass(); i++) {
+            int b = i - buildOffset;
+            if (b >= 0 && b < buildEdges.length) {
+                // only nodes that exist have outgoing edges; reuse the node object
+                if (buildEdges[b] != null)
+                    makeForwardEdges(buildNodes[b], aaList, aaIndices, false);
+            } else {
+                makeForwardEdges(new NominalMass(i), aaList, aaIndices, false);
+            }
+        }
     }
 
     private void setBackwardEdgesFromSink() {
@@ -301,25 +450,30 @@ public class FlexAminoAcidGraph extends DeNovoGraph<NominalMass> {
         edgeMap.put(pmNode, edges);
     }
 
-    private void makeForwardEdges(NominalMass curNode, ArrayList<AminoAcid> aaList, boolean addCleavageScore) {
-        if (edgeMap.get(curNode) == null)
+    private void makeForwardEdges(NominalMass curNode, ArrayList<AminoAcid> aaList, int[] aaIndices, boolean addCleavageScore) {
+        if (getBuildEdges(curNode.getNominalMass()) == null)
             return;
         int curNominalMass = curNode.getNominalMass();
-        for (AminoAcid aa : aaList) {
+        for (int k = 0, numAA = aaList.size(); k < numAA; k++) {
+            AminoAcid aa = aaList.get(k);
             int nextNodeNominalMass = curNominalMass + aa.getNominalMass();
             if (nextNodeNominalMass >= pmNode.getNominalMass())
                 continue;
-            NominalMass nextNode = new NominalMass(nextNodeNominalMass);
-            ArrayList<DeNovoGraph.Edge<NominalMass>> edges = edgeMap.get(nextNode);
+            ArrayList<DeNovoGraph.Edge<NominalMass>> edges = getBuildEdges(nextNodeNominalMass);
+            NominalMass nextNode;
             if (edges == null) {
+                nextNode = new NominalMass(nextNodeNominalMass);
                 edges = new ArrayList<DeNovoGraph.Edge<NominalMass>>();
-                edgeMap.put(nextNode, edges);
+                putBuildEdges(nextNode, edges);
+            } else {
+                int b = nextNodeNominalMass - buildOffset;
+                nextNode = (b >= 0 && b < buildNodes.length) ? buildNodes[b] : new NominalMass(nextNodeNominalMass);
             }
 
             DeNovoGraph.Edge<NominalMass> edge = new DeNovoGraph.Edge<NominalMass>(
                     curNode,
                     aa.getProbability(),
-                    aaSet.getIndex(aa),
+                    aaIndices[k],
                     aa.getMass());
 //			if(curNode.getNominalMass() == 57 && nextNode.getNominalMass() == 114)
 //				System.out.println("Debug");

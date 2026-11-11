@@ -47,6 +47,91 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
     private HashMap<T, ScoreDist> fwdTable;
     private HashMap<T, Integer> minScoreTable = null;
 
+    // Array versions of fwdTable and minScoreTable for nodes that have a dense index
+    // (DeNovoGraph.getNodeIndex); nodes without one keep using the maps
+    private ScoreDist[] fwdArr = null;
+    private int[] minScoreArr = null;
+    private boolean[] hasMinScoreArr = null;
+
+    private boolean useNodeIndex() {
+        // fwdTable evicts entries only if its capacity is below the number of nodes;
+        // the arrays never evict, so use them only when no eviction can happen
+        return graph.getNodeIndexSize() > 0
+                && gfTableCapacity >= 1 + graph.intermediateNodes.size() + graph.sinkNodes.size();
+    }
+
+    private ScoreDist getFwd(T node) {
+        if (fwdArr != null) {
+            int i = graph.getNodeIndex(node);
+            if (i >= 0)
+                return fwdArr[i];
+        }
+        return fwdTable.get(node);
+    }
+
+    private void putFwd(T node, ScoreDist dist) {
+        fwdTable.put(node, dist);
+        if (fwdArr != null) {
+            int i = graph.getNodeIndex(node);
+            if (i >= 0)
+                fwdArr[i] = dist;
+        }
+    }
+
+    // Index of an edge's previous node: cached on the edge by the graph when available
+    private int prevNodeIndex(DeNovoGraph.Edge<T> edge) {
+        int i = edge.getPrevNodeIndex();
+        if (i == DeNovoGraph.Edge.NO_PREV_NODE_INDEX)
+            i = graph.getNodeIndex(edge.getPrevNode());
+        return i;
+    }
+
+    // Same as getFwd(edge.getPrevNode())
+    private ScoreDist getFwdOfPrev(DeNovoGraph.Edge<T> edge) {
+        if (fwdArr != null) {
+            int i = prevNodeIndex(edge);
+            if (i >= 0)
+                return fwdArr[i];
+        }
+        return fwdTable.get(edge.getPrevNode());
+    }
+
+    // Reusable buffers for setCurNode (replaces a per-node ArrayList of edges)
+    @SuppressWarnings("unchecked")
+    private DeNovoGraph.Edge<T>[] edgeBuffer = new DeNovoGraph.Edge[32];
+    private ScoreDist[] prevDistBuffer = new ScoreDist[32];
+
+    private boolean hasMinScore(T node) {
+        if (minScoreArr != null) {
+            int i = graph.getNodeIndex(node);
+            if (i >= 0)
+                return hasMinScoreArr[i];
+        }
+        return minScoreTable.get(node) != null;
+    }
+
+    // only valid if hasMinScore(node)
+    private int getMinScoreOf(T node) {
+        if (minScoreArr != null) {
+            int i = graph.getNodeIndex(node);
+            if (i >= 0)
+                return minScoreArr[i];
+        }
+        return minScoreTable.get(node);
+    }
+
+    private void putMinScore(T node, int score) {
+        if (minScoreArr != null) {
+            int i = graph.getNodeIndex(node);
+            if (i >= 0) {
+                minScoreArr[i] = score;
+                hasMinScoreArr[i] = true;
+                return;
+            }
+        }
+        minScoreTable.put(node, score);
+    }
+
     private boolean isGFComputed = false;
 
 //	private HashMap<T, Integer> srmScore = null;
@@ -253,17 +338,21 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
 
     public void setUpScoreThreshold(int score) {
         minScoreTable = new HashMap<T, Integer>();
+        if (useNodeIndex()) {
+            minScoreArr = new int[graph.getNodeIndexSize()];
+            hasMinScoreArr = new boolean[graph.getNodeIndexSize()];
+        } else {
+            minScoreArr = null;
+            hasMinScoreArr = null;
+        }
         if (enzyme != null)
             score -= graph.getAASet().getNeighboringAACleavageCredit();
 
         for (T sink : graph.getSinkList()) {
-            minScoreTable.put(sink, score);
+            putMinScore(sink, score);
             for (DeNovoGraph.Edge<T> edge : graph.getEdges(sink)) {
-                T prevNode = edge.getPrevNode();
                 int newPrevMinScore = score - edge.getEdgeScore();
-                Integer prevMinScore = minScoreTable.get(prevNode);
-                if (prevMinScore == null || prevMinScore > newPrevMinScore)
-                    minScoreTable.put(prevNode, newPrevMinScore);
+                lowerPrevMinScore(edge, newPrevMinScore);
             }
         }
 
@@ -271,18 +360,35 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
 
         for (int i = intermediateNodeList.size() - 1; i >= 0; i--) {
             T curNode = intermediateNodeList.get(i);
-            Integer curScore = minScoreTable.get(curNode);
-            if (curScore == null)
+            if (!hasMinScore(curNode))
                 continue;
+            int curScore = getMinScoreOf(curNode);
             int curNodeScore = graph.getNodeScore(curNode);
-            for (DeNovoGraph.Edge<T> edge : graph.getEdges(curNode)) {
-                T prevNode = edge.getPrevNode();
+            ArrayList<DeNovoGraph.Edge<T>> edges = graph.getEdges(curNode);
+            for (int e = 0, numEdges = edges.size(); e < numEdges; e++) {
+                DeNovoGraph.Edge<T> edge = edges.get(e);
                 int newPrevMinScore = curScore - (curNodeScore + edge.getEdgeScore());
-                Integer prevMinScore = minScoreTable.get(prevNode);
-                if (prevMinScore == null || prevMinScore > newPrevMinScore)
-                    minScoreTable.put(prevNode, newPrevMinScore);
+                lowerPrevMinScore(edge, newPrevMinScore);
             }
         }
+    }
+
+    // minScore(prevNode) = min(minScore(prevNode), newPrevMinScore), creating the entry if absent
+    private void lowerPrevMinScore(DeNovoGraph.Edge<T> edge, int newPrevMinScore) {
+        if (minScoreArr != null) {
+            int i = prevNodeIndex(edge);
+            if (i >= 0) {
+                if (!hasMinScoreArr[i] || minScoreArr[i] > newPrevMinScore) {
+                    minScoreArr[i] = newPrevMinScore;
+                    hasMinScoreArr[i] = true;
+                }
+                return;
+            }
+        }
+        T prevNode = edge.getPrevNode();
+        Integer prevMinScore = minScoreTable.get(prevNode);
+        if (prevMinScore == null || prevMinScore > newPrevMinScore)
+            minScoreTable.put(prevNode, newPrevMinScore);
     }
 
     public boolean computeGeneratingFunction() {
@@ -294,7 +400,8 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
         if (calcProb)
             sourceDist.setProb(0, 1);
         fwdTable = new GFTable(gfTableCapacity);
-        fwdTable.put(graph.getSource(), sourceDist);
+        fwdArr = useNodeIndex() ? new ScoreDist[graph.getNodeIndexSize()] : null;
+        putFwd(graph.getSource(), sourceDist);
         if (backtrack) {
             backtrackTable = new BacktrackTable<T>(graph);
             BacktrackPointer sourcePointer = new BacktrackPointer(0, 1, 0);
@@ -316,7 +423,7 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
 
         for (T curNode : graph.getSinkList()) {
             setCurNode(curNode, factory);
-            ScoreDist curDist = fwdTable.get(curNode);
+            ScoreDist curDist = getFwd(curNode);
             if (curDist == null)    // curNode is not connected from the source
                 continue;
             if (curDist.getMinScore() < minScore)
@@ -387,17 +494,23 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
         if (minScoreTable == null)
             curMinScore = Integer.MAX_VALUE;
         else {
-            Integer min = minScoreTable.get(curNode);
-            if (min == null)
+            if (!hasMinScore(curNode))
                 return;
-            curMinScore = min;
+            curMinScore = getMinScoreOf(curNode);
         }
 
         // determine minScore and maxScore
-        ArrayList<DeNovoGraph.Edge<T>> edges = new ArrayList<DeNovoGraph.Edge<T>>(); // modified by kyowon
-        for (DeNovoGraph.Edge<T> edge : graph.getEdges(curNode)) {
-            T prevNode = edge.getPrevNode();
-            ScoreDist prevDist = fwdTable.get(prevNode);
+        // (edges with a predecessor distribution, and those distributions, are kept in edgeBuffer / prevDistBuffer)
+        ArrayList<DeNovoGraph.Edge<T>> allEdges = graph.getEdges(curNode);
+        int numAllEdges = allEdges.size();
+        if (edgeBuffer.length < numAllEdges) {
+            edgeBuffer = java.util.Arrays.copyOf(edgeBuffer, Math.max(numAllEdges, edgeBuffer.length * 2));
+            prevDistBuffer = java.util.Arrays.copyOf(prevDistBuffer, edgeBuffer.length);
+        }
+        int numEdges = 0;
+        for (int e = 0; e < numAllEdges; e++) {
+            DeNovoGraph.Edge<T> edge = allEdges.get(e);
+            ScoreDist prevDist = getFwdOfPrev(edge);
             if (prevDist != null) {
                 int edgeScore = edge.getEdgeScore();
                 int combinedScore = curNodeScore + edgeScore;
@@ -407,7 +520,9 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
                     if (prevDist.getMinScore() + combinedScore < curMinScore)
                         curMinScore = prevDist.getMinScore() + combinedScore;
                 }
-                edges.add(edge);
+                edgeBuffer[numEdges] = edge;
+                prevDistBuffer[numEdges] = prevDist;
+                numEdges++;
             }
         }
         if (curMinScore >= curMaxScore)
@@ -437,9 +552,10 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
         BacktrackPointer backPointer = null;
         if (backtrack)
             backPointer = new BacktrackPointer(curMinScore, curMaxScore, curNodeScore);
-        for (DeNovoGraph.Edge<T> edge : edges) {
+        for (int e = 0; e < numEdges; e++) {
+            DeNovoGraph.Edge<T> edge = edgeBuffer[e];
             T prevNode = edge.getPrevNode();
-            ScoreDist prevDist = fwdTable.get(prevNode);
+            ScoreDist prevDist = prevDistBuffer[e];    // = getFwd(prevNode); fwd tables do not change within this loop
             if (prevDist != null) {
                 int edgeScore = edge.getEdgeScore();
                 int combinedScore = curNodeScore + edgeScore;
@@ -461,7 +577,7 @@ public class GeneratingFunction<T extends Matter> implements GF<T> {
                 curDist.setProb(curDist.maxScore - 1, Float.MIN_VALUE);
             }
         }
-        fwdTable.put(curNode, curDist);
+        putFwd(curNode, curDist);
         if (backtrack)
             backtrackTable.put(curNode, backPointer);
     }

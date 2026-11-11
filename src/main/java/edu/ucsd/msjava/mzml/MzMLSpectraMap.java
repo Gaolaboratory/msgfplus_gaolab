@@ -43,6 +43,13 @@ public class MzMLSpectraMap implements SpectrumAccessorBySpecIndex {
         return null;
     }
 
+    /**
+     * The jmzML spectrum with the given ID, without conversion or MS level filtering
+     */
+    uk.ac.ebi.jmzml.model.mzml.Spectrum getJmzMLSpectrumById(String specId) throws MzMLUnmarshallerException {
+        return unmarshaller.getSpectrumById(specId);
+    }
+
     public ArrayList<Integer> getSpecIndexList() {
         return new ArrayList<Integer>(unmarshaller.getSpectrumIndexes());
     }
