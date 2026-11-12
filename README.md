@@ -1,3 +1,6 @@
+**This is forked from original MS-GF+ github repo and maintained by Gao laboratory at University of Illinois Chicago.**
+The main change is a speed up of the original version. If you use this tool, please give credit to original authors and cite their publications.
+
 Overview
 ======
 
